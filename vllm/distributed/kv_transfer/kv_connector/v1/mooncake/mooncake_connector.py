@@ -1261,6 +1261,7 @@ class MooncakeConnectorWorker:
         dp_local_rank = parallel_config.data_parallel_rank_local
         self.dp_rank = dp_local_rank if parallel_config.local_engines_only else dp_rank
         pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        self.pp_size = pp_size
         if pp_size > 1:
             raise ValueError(
                 "Mooncake Transfer Engine does not support pipeline parallelism yet."
