@@ -908,6 +908,22 @@ class VllmConfig:
         if self.lora_config is not None:
             self.lora_config.verify_with_model_config(self.model_config)
 
+        # DSpark's draft model wrapper does not implement the MixtureOfExperts
+        # protocol, so EPLB cannot register or rebalance its experts. Under EPLB
+        # the target model would be rebalanced while the draft keeps a stale
+        # expert map, silently diverging routing/weights. Fail closed instead.
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "dspark"
+            and self.parallel_config.enable_eplb
+        ):
+            raise ValueError(
+                "DSpark speculative decoding is not compatible with EPLB "
+                "(--enable-eplb): the DSpark draft model is not EPLB-managed, "
+                "so its experts would not be rebalanced with the target. Use "
+                "static expert parallelism, or disable EPLB."
+            )
+
         if (
             self.mamba_config.enable_stochastic_rounding
             and self.cache_config.mamba_ssm_cache_dtype != "float16"
