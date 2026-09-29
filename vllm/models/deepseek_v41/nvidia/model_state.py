@@ -144,6 +144,9 @@ class DeepseekV41ModelState(DefaultModelState):
         super().add_request(req_index, new_req_data)
         self._replay_start_np[req_index] = new_req_data.replay_start
 
+    def update_prefix_replay(self, req_index: int, replay_start: int) -> None:
+        self._replay_start_np[req_index] = replay_start
+
     def prepare_inputs(
         self, input_batch: InputBatch, req_states: RequestState
     ) -> dict[str, torch.Tensor | None]:
