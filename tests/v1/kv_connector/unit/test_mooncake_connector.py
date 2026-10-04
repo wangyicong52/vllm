@@ -817,6 +817,7 @@ def _make_bootstrap_vllm_config(
     data_parallel_index: int = 0,
     nnodes_within_dp: int = 1,
     bootstrap_server_address: str | None = None,
+    prefill_context_parallel_size: int = 1,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         kv_transfer_config=KVTransferConfig(
@@ -831,6 +832,7 @@ def _make_bootstrap_vllm_config(
             data_parallel_rank_local=data_parallel_rank_local,
             data_parallel_index=data_parallel_index,
             nnodes_within_dp=nnodes_within_dp,
+            prefill_context_parallel_size=prefill_context_parallel_size,
             master_addr="model-parallel-master",
             data_parallel_master_ip="data-parallel-master",
         ),
@@ -1021,6 +1023,93 @@ def test_should_launch_bootstrap_server_selects_single_owner(
     ):
         mock_pp_group.return_value.rank_in_group = pp_rank
         assert should_launch_bootstrap_server(vllm_config) is expected
+
+
+@pytest.mark.parametrize(("pcp_rank", "expected"), [(0, True), (1, False)])
+def test_should_launch_bootstrap_server_selects_canonical_pcp_rank(
+    pcp_rank: int, expected: bool
+):
+    vllm_config = _make_bootstrap_vllm_config(prefill_context_parallel_size=2)
+    with (
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_tensor_model_parallel_rank",
+            return_value=0,
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pp_group",
+            return_value=SimpleNamespace(rank_in_group=0),
+        ),
+        patch(
+            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
+            "mooncake_connector.get_pcp_group",
+            return_value=SimpleNamespace(rank_in_group=pcp_rank),
+        ),
+    ):
+        assert should_launch_bootstrap_server(vllm_config) is expected
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "pcp_size", "expected"),
+    [
+        ("kv_producer", 2, 4),
+        ("kv_producer", 1, None),
+        ("kv_consumer", 1, None),
+    ],
+)
+def test_mooncake_completion_count_uses_canonical_pcp_workers(
+    kv_role: str, pcp_size: int, expected: int | None
+):
+    connector = MooncakeConnector.__new__(MooncakeConnector)
+    connector._kv_transfer_config = SimpleNamespace(kv_role=kv_role)
+    connector._vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            world_size=8, prefill_context_parallel_size=pcp_size
+        )
+    )
+
+    assert connector.get_finished_count() == expected
+
+
+@pytest.mark.parametrize(
+    ("kv_role", "dcp_size", "error"),
+    [
+        ("kv_consumer", 1, "pure kv_producer"),
+        ("kv_both", 1, "pure kv_producer"),
+        ("kv_producer", 2, "require DCP1"),
+    ],
+)
+def test_mooncake_rejects_unsupported_pcp_topologies(
+    kv_role: str, dcp_size: int, error: str
+):
+    vllm_config = create_vllm_config(kv_connector="MooncakeConnector", kv_role=kv_role)
+    vllm_config.parallel_config.prefill_context_parallel_size = 2
+    vllm_config.parallel_config.decode_context_parallel_size = dcp_size
+
+    with pytest.raises(NotImplementedError, match=error):
+        MooncakeConnector(
+            vllm_config, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config()
+        )
+
+
+@pytest.mark.parametrize(("pcp_rank", "expected_calls"), [(0, 1), (1, 0)])
+def test_prefill_worker_tracks_send_requests_only_on_canonical_pcp_rank(
+    pcp_rank: int, expected_calls: int
+):
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.is_kv_producer = True
+    worker.is_sender_worker = pcp_rank == 0
+    worker.receiver_loop = MagicMock()
+    worker.sender_loop = MagicMock()
+    worker.record_send_reqs = MagicMock(return_value="record-send-requests")
+    metadata = MooncakeConnectorMetadata()
+    metadata.reqs_to_send["p-req-1"] = ("xfer-req-1", [])
+
+    with patch("asyncio.run_coroutine_threadsafe") as mock_run_coroutine:
+        worker.start_load_kv(metadata)
+
+    assert mock_run_coroutine.call_count == expected_calls
 
 
 @pytest.mark.parametrize(

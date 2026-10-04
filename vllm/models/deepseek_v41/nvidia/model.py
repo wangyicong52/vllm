@@ -644,20 +644,25 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.config = config
         self.quant_config = quant_config
         self.parallel_config = vllm_config.parallel_config
+        kv_transfer_config = vllm_config.kv_transfer_config
+        supports_pcp_kv_transfer = (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_connector == "MooncakeConnector"
+            and kv_transfer_config.kv_role == "kv_producer"
+        )
         if self.parallel_config.prefill_context_parallel_size > 1 and (
             self.parallel_config.pipeline_parallel_size != 1
             or self.parallel_config.data_parallel_size != 1
             or self.parallel_config.decode_context_parallel_size != 1
             or self.parallel_config.use_ubatching
             or vllm_config.speculative_config is not None
-            or vllm_config.kv_transfer_config is not None
-            or vllm_config.cache_config.enable_prefix_caching
+            or (kv_transfer_config is not None and not supports_pcp_kv_transfer)
             or vllm_config.kernel_config.moe_backend in MEGA_MOE_BACKENDS
         ):
             raise NotImplementedError(
                 "DeepSeek-V4.1 PCP currently requires PP=DP=DCP=1, with no "
-                "microbatching, speculative decoding, KV transfer, prefix "
-                "caching, or MegaMoE."
+                "microbatching, speculative decoding, or MegaMoE. KV transfer "
+                "is limited to a direct MooncakeConnector kv_producer."
             )
         self.use_native_mega_moe = (
             vllm_config.kernel_config.moe_backend in NATIVE_MEGA_MOE_BACKENDS

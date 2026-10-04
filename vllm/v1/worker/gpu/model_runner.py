@@ -1537,7 +1537,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self, input_batch: InputBatch
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         if self.pcp_manager is not None:
-            return self.pcp_manager.prepare_attn(input_batch)
+            return self.pcp_manager.prepare_attn(
+                input_batch,
+                lambda global_batch, global_slot_mappings: (
+                    self.model_state.preprocess_pcp_slot_mappings(
+                        global_batch,
+                        global_slot_mappings,
+                        self.kv_cache_config,
+                    )
+                ),
+            )
 
         # Block tables: num_kv_cache_groups x [num_reqs_padded, max_num_blocks].
         block_tables = self.block_tables.gather_block_tables(

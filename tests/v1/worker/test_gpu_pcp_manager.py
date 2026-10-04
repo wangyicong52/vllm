@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -471,6 +472,35 @@ def test_sharded_decode_layout_selects_owner_kv_for_replication(monkeypatch):
 
     assert torch.equal(gathered_kv, torch.tensor([[11.0], [33.0], [22.0], [0.0]]))
     assert torch.equal(cache_slot_mapping, torch.tensor([123, 789, 456, PAD_SLOT_ID]))
+
+
+def test_slot_mapping_preprocessor_runs_before_rank_expansion():
+    global_batch = SimpleNamespace(
+        idx_mapping=torch.tensor([0]),
+        query_start_loc=torch.tensor([0, 2], dtype=torch.int32),
+        positions=torch.tensor([8, 9]),
+        num_tokens=2,
+    )
+    global_slots = torch.tensor([[80, 90]], dtype=torch.int64)
+    block_tables = SimpleNamespace(
+        compute_slot_mappings=MagicMock(return_value=global_slots)
+    )
+    manager = PCPManager.__new__(PCPManager)
+    manager._block_tables = block_tables
+    manager._global_batch = global_batch
+    manager._global_batch_slot_mappings = torch.empty_like(global_slots)
+    manager._convert_to_gathered_slot_mappings = MagicMock(
+        side_effect=lambda slots: slots.clone()
+    )
+
+    def pad_replayed_prefix(batch: InputBatch, slots: torch.Tensor) -> None:
+        assert batch is global_batch
+        slots[0, 0] = PAD_SLOT_ID
+
+    gathered = manager.prepare_slot_mappings(pad_replayed_prefix)
+
+    assert torch.equal(gathered, torch.tensor([[PAD_SLOT_ID, 90]]))
+    manager._convert_to_gathered_slot_mappings.assert_called_once_with(global_slots)
 
 
 def test_replicated_draft_cache_inputs_keep_unexpanded_slot_mapping(monkeypatch):

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
@@ -716,7 +716,10 @@ class PCPManager:
         )
 
     def prepare_attn(
-        self, input_batch: InputBatch
+        self,
+        input_batch: InputBatch,
+        slot_mapping_preprocessor: Callable[[InputBatch, torch.Tensor], None]
+        | None = None,
     ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
         assert self._block_tables is not None
         assert self._local_block_tables is not None
@@ -727,10 +730,14 @@ class PCPManager:
             out=self._local_block_tables,
             out_ptrs=self._local_block_table_ptrs,
         )
-        slot_mappings = self.prepare_slot_mappings()
+        slot_mappings = self.prepare_slot_mappings(slot_mapping_preprocessor)
         return block_tables, slot_mappings
 
-    def prepare_slot_mappings(self) -> torch.Tensor:
+    def prepare_slot_mappings(
+        self,
+        slot_mapping_preprocessor: Callable[[InputBatch, torch.Tensor], None]
+        | None = None,
+    ) -> torch.Tensor:
         assert self._block_tables is not None
         assert self._global_batch_slot_mappings is not None
         assert self._global_batch is not None
@@ -742,6 +749,8 @@ class PCPManager:
             global_batch.num_tokens,
             out=self._global_batch_slot_mappings,
         )
+        if slot_mapping_preprocessor is not None:
+            slot_mapping_preprocessor(global_batch, global_batch_slot_mappings)
         return self._convert_to_gathered_slot_mappings(global_batch_slot_mappings)
 
     def get_dummy_slot_mappings(self, num_tokens: int) -> torch.Tensor:

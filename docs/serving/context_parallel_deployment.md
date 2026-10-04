@@ -32,12 +32,20 @@ vllm serve deepseek-ai/DeepSeek-V4.1-Flash \
     --prefill-context-parallel-size 2 \
     --attention-backend FLASHMLA_SPARSE_DSV41 \
     --moe-backend marlin \
-    --no-enable-prefix-caching \
     --enforce-eager
 ```
 
+Prefix caching is supported. For disaggregated serving, PCP can run on a pure
+Prefill producer using the direct `MooncakeConnector`; the Decode consumer must
+use PCP1:
+
+```bash
+--kv-transfer-config \
+  '{"kv_connector":"MooncakeConnector","kv_role":"kv_producer"}'
+```
+
 The initial implementation requires PP=DP=DCP=1 and excludes speculative
-decoding, CUDA graphs, microbatching, KV transfer, MegaMoE, and prefix caching.
+decoding, CUDA graphs, microbatching, connector composition, and MegaMoE.
 Engram embeddings remain TP-sharded: increasing PCP can increase host-memory
 requirements when CPU offload is enabled. Check available host memory before
 increasing PCP.
