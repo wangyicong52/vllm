@@ -2014,6 +2014,56 @@ def test_block_ids_for_region_flattens_shared_groups():
     ) == [10, 11, 12]
 
 
+def test_align_shared_region_allows_consumer_only_trailing_group():
+    producer = _region(
+        0x1000,
+        block_len=512,
+        row_offset=256,
+        layer_name="model.layers.7.swa_cache",
+        layer_index=7,
+        group_index=_SHARED_REGION_GROUP_ID,
+        shared_group_ids=(0, 1),
+    )
+    consumer = _region(
+        0xA000,
+        block_len=512,
+        row_offset=384,
+        layer_name="draft_model.layers.0.swa_cache",
+        layer_index=0,
+        group_index=_SHARED_REGION_GROUP_ID,
+        shared_group_ids=(0, 1, 2),
+    )
+
+    assert _align_transfer_regions([producer], [consumer])[2] is not None
+    aligned_producer, aligned_consumer, err = _align_transfer_regions(
+        [producer], [consumer], allow_shared_packed_aliases=True
+    )
+
+    assert err is None
+    assert aligned_producer == [producer]
+    assert aligned_consumer == [consumer]
+    assert (
+        _align_transfer_regions(
+            [consumer], [producer], allow_shared_packed_aliases=True
+        )[2]
+        is not None
+    )
+
+    ambiguous_aliases = [
+        _region(
+            base,
+            block_len=512,
+            row_offset=256,
+            layer_name=f"draft_model.layers.{index}.swa_cache",
+            layer_index=index,
+            group_index=_SHARED_REGION_GROUP_ID,
+            shared_group_ids=(0, 1, index + 2),
+        )
+        for index, base in enumerate((0xB000, 0xC000))
+    ]
+    assert _align_transfer_regions([producer], ambiguous_aliases)[2] is not None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("group_index", "local_ids", "remote_ids", "n_blocks"),
@@ -2087,6 +2137,72 @@ async def test_build_transfer_params_sends_packed_region_once(
     assert src_ptrs == [0x1000 + 10 * block_len]
     assert dst_ptrs == [0xA000 + 20 * block_len]
     assert lengths == [n_blocks * block_len]
+
+
+@pytest.mark.asyncio
+async def test_build_transfer_params_ignores_consumer_only_shared_group():
+    """A Decode-only DSpark group must not enter the target-KV transfer."""
+    worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
+    worker.async_zmq_ctx = MagicMock()
+    worker.is_kv_consumer = True
+    worker.is_kv_producer = True
+    worker.tp_rank = 0
+    worker.tp_size = 1
+    worker.use_mla = True
+    worker.kv_cache_config = _make_packed_mla_kv_cache_config(
+        num_blocks=4, num_groups=2
+    )
+    worker._physical_blocks_per_logical_kv_block = 1
+    worker.transfer_topo = SimpleNamespace(
+        local_replicates_kv_cache=False,
+        total_num_kv_heads=1,
+    )
+
+    block_len = 256
+    producer = _region(
+        0x1000,
+        block_len=block_len,
+        row_offset=0,
+        group_index=_SHARED_REGION_GROUP_ID,
+        shared_group_ids=(0, 1),
+    )
+    consumer = _region(
+        0xA000,
+        block_len=block_len,
+        row_offset=0,
+        group_index=_SHARED_REGION_GROUP_ID,
+        shared_group_ids=(0, 1, 2),
+    )
+    transfer_id = "xfer-dspark-local-group"
+    send_meta = SendBlockMeta(
+        p_req_id="p-dspark-local-group",
+        transfer_id=transfer_id,
+        local_block_ids=[[10], [11]],
+        ready=asyncio.Event(),
+    )
+    xfer_meta = _xfer_meta(
+        [consumer],
+        {"d-dspark-local-group": (transfer_id, [[20], [21], []])},
+    )
+
+    (
+        src_ptrs,
+        dst_ptrs,
+        lengths,
+        err_reqs,
+        err_msg,
+    ) = await worker._build_transfer_params(
+        ready_reqs=[("d-dspark-local-group", send_meta)],
+        agent_meta=xfer_meta,
+        local_regions=[producer],
+        remote_regions=[consumer],
+    )
+
+    assert err_reqs == []
+    assert err_msg is None
+    assert src_ptrs == [0x1000 + 10 * block_len]
+    assert dst_ptrs == [0xA000 + 20 * block_len]
+    assert lengths == [2 * block_len]
 
 
 def test_coalesce_promotes_padding_only_for_a_full_row():
