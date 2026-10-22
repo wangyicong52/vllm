@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
 )
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -35,13 +36,18 @@ class RankSegment:
         return self.global_batch_slice.stop - self.global_batch_slice.start
 
 
+@dataclass
+class PCPAttnMetadata(ModelSpecificAttnMetadata):
+    global_batch: InputBatch
+
+
 class PCPManager:
     """MRV2 PC batch manager.
 
     The model runner keeps the global scheduled batch. This manager rewrites only
     the per-step InputBatch into rank-local DualChunkSwap rows and keeps the
-    global-batch view private to restore to the global batch shape before
-    sampling/postprocess.
+    global-batch view to prepare model-specific metadata and restore the global
+    shape before sampling/postprocess.
     """
 
     def __init__(
@@ -450,6 +456,11 @@ class PCPManager:
     def global_batch(self) -> InputBatch:
         assert self._global_batch is not None
         return self._global_batch
+
+    def get_attn_metadata(self, input_batch: InputBatch) -> PCPAttnMetadata | None:
+        if input_batch is not self._local_batch:
+            return None
+        return PCPAttnMetadata(self.global_batch)
 
     def partition_batch(
         self, input_batch: InputBatch, batch_desc: "BatchExecutionDescriptor"
