@@ -1944,6 +1944,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 slot_mappings,
                 attn_groups,
                 self.kv_cache_config,
+                global_input_batch=(
+                    self.pcp_manager.global_batch
+                    if self.pcp_manager is not None and not dummy_run
+                    else None
+                ),
                 # FULL replay reads capture-time metadata buffers. Re-stage them
                 # from the zeroed dummy block tables instead of retaining state
                 # indices from the previous real batch.

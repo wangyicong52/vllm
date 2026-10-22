@@ -173,6 +173,8 @@ class EncoderOnlyModelState(DefaultModelState):
         for_capture: bool = False,
         ubatch_idx: int = 0,
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+        *,
+        global_input_batch: InputBatch | None = None,
     ) -> dict[str, Any]:
         assert ubatch_idx == 0, "DBO is not supported"
         attn_metadata = super().prepare_attn(
