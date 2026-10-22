@@ -17,6 +17,7 @@ from vllm.v1.worker.gpu.input_batch import (
     InputBatch,
     InputBuffers,
 )
+from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -35,8 +36,8 @@ class RankSegment:
         return self.global_batch_slice.stop - self.global_batch_slice.start
 
 
-@dataclass(kw_only=True)
-class PCPInputBatch(InputBatch):
+@dataclass
+class PCPAttnMetadata(ModelSpecificAttnMetadata):
     global_batch: InputBatch
 
 
@@ -456,6 +457,11 @@ class PCPManager:
         assert self._global_batch is not None
         return self._global_batch
 
+    def get_attn_metadata(self, input_batch: InputBatch) -> PCPAttnMetadata | None:
+        if input_batch is not self._local_batch:
+            return None
+        return PCPAttnMetadata(self.global_batch)
+
     def partition_batch(
         self, input_batch: InputBatch, batch_desc: "BatchExecutionDescriptor"
     ) -> InputBatch:
@@ -677,7 +683,7 @@ class PCPManager:
             )
 
         self._local_batch = replace(
-            PCPInputBatch(**vars(input_batch), global_batch=global_batch),
+            input_batch,
             req_ids=local_req_ids,
             num_reqs=num_local_reqs,
             num_reqs_after_padding=num_reqs_after_padding,
