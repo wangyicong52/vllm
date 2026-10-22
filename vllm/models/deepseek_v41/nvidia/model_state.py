@@ -33,7 +33,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
-from vllm.v1.worker.gpu.pcp_manager import PCPInputBatch
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -507,9 +506,9 @@ class DeepseekV41ModelState(DefaultModelState):
         kept_replay_start = replay_start
         if self.pcp_size > 1:
             # Startup dummy batches have no global PCP layout and never trim.
-            if not isinstance(input_batch, PCPInputBatch):
+            global_batch = input_batch.pcp_global_batch
+            if global_batch is None:
                 return
-            global_batch = input_batch.global_batch
             global_query_lens = global_batch.num_scheduled_tokens
             global_kept_lens = np.where(
                 self._keeps_rows_np[global_batch.idx_mapping_np],

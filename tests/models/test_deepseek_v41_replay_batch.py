@@ -25,7 +25,6 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
-from vllm.v1.worker.gpu.pcp_manager import PCPInputBatch
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="the replay buffers live on the GPU"
@@ -315,7 +314,7 @@ def test_pcp_replay_keeps_global_tail_after_prefix_hit(state, monkeypatch):
             [i == 1 for i in indices],
             num_tokens_after_padding=258,
         )
-        batch = PCPInputBatch(**vars(batch), global_batch=global_batch)
+        batch = replace(batch, pcp_global_batch=global_batch)
         batch.idx_mapping_np = np.array(indices, dtype=np.intp)
         slots = _slot_mappings(516)
         state.prepare_attn(batch, CUDAGraphMode.NONE, BLOCK_TABLES, slots, [], GROUPS)

@@ -35,11 +35,6 @@ class RankSegment:
         return self.global_batch_slice.stop - self.global_batch_slice.start
 
 
-@dataclass(kw_only=True)
-class PCPInputBatch(InputBatch):
-    global_batch: InputBatch
-
-
 class PCPManager:
     """MRV2 PC batch manager.
 
@@ -677,7 +672,8 @@ class PCPManager:
             )
 
         self._local_batch = replace(
-            PCPInputBatch(**vars(input_batch), global_batch=global_batch),
+            input_batch,
+            pcp_global_batch=global_batch,
             req_ids=local_req_ids,
             num_reqs=num_local_reqs,
             num_reqs_after_padding=num_reqs_after_padding,
