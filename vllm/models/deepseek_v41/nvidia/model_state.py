@@ -33,7 +33,6 @@ from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.mm.encoder_cache import EncoderCache
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
-from vllm.v1.worker.gpu.pcp_manager import PCPInputBatch
 from vllm.v1.worker.gpu.states import RequestState
 from vllm.v1.worker.utils import AttentionGroup
 
@@ -329,6 +328,8 @@ class DeepseekV41ModelState(DefaultModelState):
         for_capture: bool = False,
         ubatch_idx: int = 0,
         model_specific_attn_metadata: ModelSpecificAttnMetadata | None = None,
+        *,
+        global_input_batch: InputBatch | None = None,
     ) -> dict[str, Any]:
         if self._replay is None:
             specs = [group.kv_cache_spec for group in kv_cache_config.kv_cache_groups]
@@ -420,6 +421,7 @@ class DeepseekV41ModelState(DefaultModelState):
                 attn_groups,
                 kv_cache_config,
                 replay_start,
+                global_input_batch=global_input_batch,
             )
         return attn_metadata
 
@@ -488,6 +490,8 @@ class DeepseekV41ModelState(DefaultModelState):
         kv_cache_config: KVCacheConfig,
         replay_start: torch.Tensor,
         capture_desc: BatchExecutionDescriptor | None = None,
+        *,
+        global_input_batch: InputBatch | None = None,
     ) -> None:
         """Set the replay layers' batch for this forward, or none. Eager steps trim;
         captures and PIECEWISE graphs at the trim threshold or above break out to a
@@ -507,9 +511,9 @@ class DeepseekV41ModelState(DefaultModelState):
         kept_replay_start = replay_start
         if self.pcp_size > 1:
             # Startup dummy batches have no global PCP layout and never trim.
-            if not isinstance(input_batch, PCPInputBatch):
+            if global_input_batch is None:
                 return
-            global_batch = input_batch.global_batch
+            global_batch = global_input_batch
             global_query_lens = global_batch.num_scheduled_tokens
             global_kept_lens = np.where(
                 self._keeps_rows_np[global_batch.idx_mapping_np],
