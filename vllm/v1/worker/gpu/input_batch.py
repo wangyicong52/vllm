@@ -123,6 +123,9 @@ class InputBatch:
     # None if there are no prefills.
     prefill_runs_as_decode_np: np.ndarray | None = None
 
+    # The scheduled batch before PCP partitioning; absent for dummy batches.
+    pcp_global_batch: "InputBatch | None" = None
+
     @classmethod
     def make_dummy(
         cls,
