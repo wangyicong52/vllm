@@ -4,7 +4,6 @@
 import asyncio
 import contextlib
 import errno
-import queue
 import socket
 import threading
 import time
@@ -60,7 +59,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     MLAAttentionSpec,
 )
-from vllm.v1.outputs import KVConnectorOutput
+from vllm.v1.outputs import KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import RequestStatus
 
 from .utils import (
@@ -216,16 +215,6 @@ def _make_packed_mla_kv_cache_config(
         kv_cache_tensors=[],
         kv_cache_groups=groups,
     )
-
-
-class _TestAttentionBackend:
-    @staticmethod
-    def get_name() -> str:
-        return "TEST"
-
-    @staticmethod
-    def get_supported_kernel_block_sizes(kv_cache_spec=None) -> list[int]:
-        return [16]
 
 
 class FakeMooncakeWrapper:
@@ -1137,7 +1126,7 @@ def test_scheduler_request_finished():
 
 
 @contextlib.contextmanager
-def patch_worker_dependencies():
+def patch_worker_dependencies(*, pcp_rank: int = 0):
     """Helper to mock all distributed and network dependencies for Worker tests."""
     with (
         patch(
@@ -1177,7 +1166,7 @@ def patch_worker_dependencies():
         mock_pp.return_value = mock_pp_group
 
         mock_pcp_group = MagicMock()
-        mock_pcp_group.rank_in_group = 0
+        mock_pcp_group.rank_in_group = pcp_rank
         mock_pcp.return_value = mock_pcp_group
 
         # Mock ZMQ socket
@@ -1252,15 +1241,23 @@ def _xfer_meta(
 
 
 @contextlib.contextmanager
-def mooncake_register_worker(kv_cache_config, *, kv_role: str = "kv_consumer"):
+def mooncake_register_worker(
+    kv_cache_config,
+    *,
+    kv_role: str = "kv_consumer",
+    pcp_rank: int = 0,
+    pcp_size: int = 1,
+):
     """Build a worker whose engine registration and sender thread are patched."""
     vllm_config = _make_worker_vllm_config(kv_role)
+    vllm_config.parallel_config.prefill_context_parallel_size = pcp_size
+    vllm_config.parallel_config.world_size = pcp_size
     connector_mod = (
         "vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_connector"
     )
     with (
         set_current_vllm_config(vllm_config),
-        patch_worker_dependencies(),
+        patch_worker_dependencies(pcp_rank=pcp_rank),
         patch(f"{connector_mod}.threading.Event"),
         patch(f"{connector_mod}.threading.Thread") as mock_thread,
     ):
@@ -1272,87 +1269,68 @@ def mooncake_register_worker(kv_cache_config, *, kv_role: str = "kv_consumer"):
         with patch.object(
             worker.engine, "batch_register_memory", return_value=0
         ) as reg:
-            yield worker, reg
+            try:
+                yield worker, reg
+            finally:
+                if kv_role == "kv_producer":
+                    worker.shutdown()
+                    worker.sender_loop.close()
+                    worker.shutdown = MagicMock()
 
 
-@pytest.mark.parametrize(("pcp_rank", "expected_calls"), [(0, 1), (1, 0)])
+@pytest.mark.parametrize("pcp_rank", [0, 1])
 @pytest.mark.skip_global_cleanup
-def test_prefill_worker_tracks_send_requests_only_on_canonical_pcp_rank(
-    pcp_rank: int, expected_calls: int
-):
-    worker = object.__new__(MooncakeConnectorWorker)
-    worker.is_kv_producer = True
-    worker.is_kv_consumer = False
-    worker.pcp_rank = pcp_rank
-    worker._replicated_pcp_done_sending = set()
-    worker.receiver_loop = MagicMock()
-    worker.sender_loop = MagicMock()
-    worker.record_send_reqs = MagicMock(return_value="record-send-requests")
-    worker.shutdown = MagicMock()
-    metadata = MooncakeConnectorMetadata()
-    metadata.reqs_to_send["p-req-1"] = ("xfer-req-1", [])
-
-    with patch("asyncio.run_coroutine_threadsafe") as mock_run_coroutine:
-        worker.start_load_kv(metadata)
-
-    assert mock_run_coroutine.call_count == expected_calls
-    assert worker.record_send_reqs.call_count == expected_calls
-    del worker
-
-
-def _make_scheduler_vllm_config(
-    *,
-    kv_role: str,
-    tp_size: int,
-    pcp_size: int = 1,
-    dcp_size: int = 1,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        kv_transfer_config=SimpleNamespace(
-            engine_id="engine-1",
-            kv_role=kv_role,
-        ),
-        parallel_config=SimpleNamespace(
-            world_size=tp_size * pcp_size,
-            prefill_context_parallel_size=pcp_size,
-            decode_context_parallel_size=dcp_size,
-        ),
-        cache_config=SimpleNamespace(block_size=16),
-        scheduler_config=SimpleNamespace(
-            disable_hybrid_kv_cache_manager=False,
-        ),
-    )
+def test_pcp_producer_uses_canonical_sender(pcp_rank):
+    with mooncake_register_worker(
+        _make_test_kv_cache_config(),
+        kv_role="kv_producer",
+        pcp_rank=pcp_rank,
+        pcp_size=2,
+    ) as (worker, _):
+        spec = FullAttentionSpec(
+            block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
+        )
+        raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.int8)
+        (cache,) = dense_kv_cache_views(
+            raw, spec, num_blocks=2, num_layers=1, layout=KVCacheLayout.LBHNC
+        )
+        metadata = MooncakeConnectorMetadata()
+        metadata.reqs_to_send["req"] = ("transfer", [])
+        with patch("asyncio.run_coroutine_threadsafe") as submit:
+            worker.register_kv_caches({"model.layers.0.self_attn": cache})
+            worker.start_load_kv(metadata)
+            assert submit.call_count == (2 if pcp_rank == 0 else 0)
+            for call in submit.call_args_list:
+                call.args[0].close()
 
 
 @pytest.mark.skip_global_cleanup
 @pytest.mark.parametrize("with_sibling", [False, True])
 def test_pcp_completion_waits_for_final_metadata_and_canonical_sender(with_sibling):
     """Allocation is not completion; each worker must finish every async save."""
-    worker = object.__new__(MooncakeConnectorWorker)
-    worker.is_kv_producer = True
-    worker.is_kv_consumer = False
-    worker.pcp_rank = 1
-    worker._replicated_pcp_done_sending = set()
-    worker._failed_recv_reqs = queue.Queue()
-    worker.shutdown = MagicMock()
-    metadata = MooncakeConnectorMetadata()
-    metadata.reqs_to_send["req-1"] = ("xfer-1", [])
-    worker.start_load_kv(metadata)
-    assert worker.get_finished() == (None, None)
+    with mooncake_register_worker(
+        _make_test_kv_cache_config(),
+        kv_role="kv_producer",
+        pcp_rank=1,
+        pcp_size=2,
+    ) as (worker, _):
+        metadata = MooncakeConnectorMetadata()
+        metadata.reqs_to_send["req-1"] = ("xfer-1", [])
+        worker.start_load_kv(metadata)
+        assert worker.get_finished() == (None, None)
 
-    # Aborted requests never ask the scheduler to delay block release.
-    aborted = MooncakeConnectorMetadata()
-    aborted.reqs_not_processed.add("xfer-1")
-    worker.start_load_kv(aborted)
-    assert worker.get_finished() == (None, None)
+        aborted = MooncakeConnectorMetadata()
+        aborted.reqs_not_processed.add("xfer-1")
+        worker.start_load_kv(aborted)
+        assert worker.get_finished() == (None, None)
 
-    metadata.reqs_to_send["req-2"] = ("xfer-2", [[0]])
-    worker.start_load_kv(metadata)
-    noncanonical = worker.get_transfer_results()
-    assert noncanonical.finished_sending == {"req-2"}
-    assert not worker.get_transfer_results().finished_sending
+        metadata.reqs_to_send["req-2"] = ("xfer-2", [[0]])
+        worker.start_load_kv(metadata)
+        noncanonical = worker.get_transfer_results()
+        assert noncanonical.finished_sending == {"req-2"}
+        assert not worker.get_transfer_results().finished_sending
+        config = worker.vllm_config
 
-    config = _make_scheduler_vllm_config(kv_role="kv_producer", tp_size=1, pcp_size=2)
     connector = MooncakeConnector(
         config, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config()
     )
@@ -1381,13 +1359,12 @@ def test_pcp_completion_waits_for_final_metadata_and_canonical_sender(with_sibli
     aggregator = KVOutputAggregator.from_connector(connector, world_size=2)
 
     def aggregate(finished):
-        output = SimpleNamespace(
-            kv_connector_output=KVConnectorOutput(finished_sending=finished)
+        output = ModelRunnerOutput.with_kv_conn_output_only(
+            KVConnectorOutput(finished_sending=finished)
         )
         return aggregator.aggregate([output]).kv_connector_output.finished_sending
 
     assert not aggregate(noncanonical.finished_sending)
-    # Canonical sender is still holding the real transfer's blocks.
     assert not aggregate(set())
     assert aggregate({"req-2"}) == {"req-2"}
 
@@ -1396,67 +1373,33 @@ def test_pcp_completion_waits_for_final_metadata_and_canonical_sender(with_sibli
     ("kv_role", "pcp_size", "dcp_size", "error_match"),
     [
         ("kv_producer", 2, 1, None),
-        (
-            "kv_producer",
-            2,
-            2,
-            "PCP with DCP-sharded KV requires DCP-aware worker discovery",
-        ),
-        (
-            "kv_consumer",
-            2,
-            1,
-            "Consumers and kv_both require prefill_context_parallel_size=1",
-        ),
-        (
-            "kv_both",
-            2,
-            1,
-            "Consumers and kv_both require prefill_context_parallel_size=1",
-        ),
+        ("kv_producer", 2, 2, "PCP with DCP-sharded KV"),
+        ("kv_consumer", 2, 1, "Consumers and kv_both require"),
+        ("kv_both", 2, 1, "Consumers and kv_both require"),
         ("kv_producer", 1, 2, None),
         ("kv_consumer", 1, 2, None),
         ("kv_both", 1, 2, None),
     ],
-    ids=[
-        "producer_pcp2",
-        "producer_pcp2_dcp2",
-        "consumer_pcp2",
-        "both_pcp2",
-        "producer_pcp1_dcp2",
-        "consumer_pcp1_dcp2",
-        "both_pcp1_dcp2",
-    ],
 )
 @pytest.mark.skip_global_cleanup
 def test_connector_validates_supported_pcp_topologies(
-    kv_role: str,
-    pcp_size: int,
-    dcp_size: int,
-    error_match: str | None,
+    kv_role,
+    pcp_size,
+    dcp_size,
+    error_match,
 ):
-    vllm_config = _make_scheduler_vllm_config(
-        kv_role=kv_role,
-        tp_size=2,
-        pcp_size=pcp_size,
-        dcp_size=dcp_size,
-    )
-
-    if error_match is not None:
-        with pytest.raises(NotImplementedError, match=error_match):
-            MooncakeConnector(
-                vllm_config,
-                KVConnectorRole.SCHEDULER,
-                _make_test_kv_cache_config(),
-            )
-        return
-
-    connector = MooncakeConnector(
-        vllm_config,
-        KVConnectorRole.SCHEDULER,
-        _make_test_kv_cache_config(),
-    )
-    assert connector.get_finished_count() is None
+    config = _make_worker_vllm_config(kv_role)
+    config.parallel_config.prefill_context_parallel_size = pcp_size
+    config.parallel_config.decode_context_parallel_size = dcp_size
+    with (
+        pytest.raises(NotImplementedError, match=error_match)
+        if error_match
+        else contextlib.nullcontext()
+    ):
+        connector = MooncakeConnector(
+            config, KVConnectorRole.SCHEDULER, _make_test_kv_cache_config()
+        )
+        assert connector.get_finished_count() is None
 
 
 @pytest.mark.asyncio
@@ -2181,78 +2124,6 @@ def test_register_noncontiguous_packed_allows_matching_pp():
         worker.register_kv_caches(dict(zip(layer_names, (tensor1, tensor2))))
         assert worker.kv_caches_base_addr == [raw.data_ptr()]
         assert worker.region_row_offsets == [0]
-
-
-@pytest.mark.parametrize(("pcp_rank", "expected_calls"), [(0, 1), (1, 0)])
-@pytest.mark.skip_global_cleanup
-def test_register_kv_caches_starts_sender_only_on_canonical_pcp_rank(
-    pcp_rank: int, expected_calls: int
-):
-    vllm_config = create_vllm_config(
-        kv_connector="MooncakeConnector", kv_role="kv_producer"
-    )
-    vllm_config.parallel_config.world_size = 2
-    vllm_config.parallel_config.prefill_context_parallel_size = 2
-
-    with (
-        set_current_vllm_config(vllm_config),
-        patch_worker_dependencies() as mocks,
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
-            "mooncake_connector.threading.Event"
-        ) as mock_event,
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
-            "mooncake_connector.threading.Thread"
-        ),
-        patch("torch.accelerator.current_device_index", return_value=0),
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
-            "mooncake_connector.current_platform.set_device"
-        ),
-        patch(
-            "vllm.distributed.kv_transfer.kv_connector.v1.mooncake."
-            "mooncake_connector.get_current_attn_backends",
-            return_value=[_TestAttentionBackend],
-        ),
-        patch("asyncio.run_coroutine_threadsafe") as mock_run_coroutine,
-    ):
-        mocks["mock_pcp"].return_value.rank_in_group = pcp_rank
-        connector = MooncakeConnector(
-            vllm_config,
-            KVConnectorRole.WORKER,
-            _make_test_kv_cache_config(),
-        )
-        worker = connector.connector_worker
-        listener_token = object()
-        mock_listener = MagicMock(return_value=listener_token)
-
-        spec = FullAttentionSpec(
-            block_size=16, num_kv_heads=4, head_size=64, dtype=torch.float16
-        )
-        raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.int8)
-        (cache,) = dense_kv_cache_views(
-            raw, spec, num_blocks=2, num_layers=1, layout=KVCacheLayout.LBHNC
-        )
-        kv_caches = {"model.layers.0.self_attn": cache}
-
-        with (
-            patch.object(worker.engine, "batch_register_memory", return_value=0),
-            patch.object(
-                worker,
-                "_mooncake_sender_listener",
-                new=mock_listener,
-            ),
-        ):
-            connector.register_kv_caches(kv_caches)
-
-        assert mock_listener.call_count == expected_calls
-        assert mock_run_coroutine.call_count == expected_calls
-        assert mock_event.return_value.wait.call_count == expected_calls
-
-        worker.shutdown()
-        worker.sender_loop.close()
-        worker.shutdown = MagicMock()
 
 
 def test_register_kv_caches_supports_mixed_mla_and_eagle_shapes():
